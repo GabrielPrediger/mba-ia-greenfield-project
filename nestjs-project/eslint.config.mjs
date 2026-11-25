@@ -32,4 +32,23 @@ export default tseslint.config(
       "prettier/prettier": ["error", { endOfLine: "auto" }],
     },
   },
+  {
+    // supertest types `response.body` as `any` by design (it has no way to
+    // know the handler's response shape), so every `res.body.foo` assertion
+    // in an e2e spec trips the strict `no-unsafe-*` rules from
+    // `recommendedTypeChecked` above. Asserting on real HTTP response
+    // bodies is the entire point of these files, so re-typing or casting
+    // every access would add noise without catching real bugs — this is
+    // the same reasoning the project already applied to
+    // `no-unsafe-argument` above, scoped to where the `any` actually
+    // originates instead of loosened project-wide.
+    files: ['test/**/*.e2e-spec.ts'],
+    rules: {
+      '@typescript-eslint/no-unsafe-member-access': 'off',
+      '@typescript-eslint/no-unsafe-assignment': 'off',
+      '@typescript-eslint/no-unsafe-call': 'off',
+      '@typescript-eslint/no-unsafe-return': 'off',
+      '@typescript-eslint/require-await': 'off',
+    },
+  },
 );

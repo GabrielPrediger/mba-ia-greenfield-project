@@ -48,3 +48,31 @@ export class TokenReuseDetectedException extends DomainException {
     );
   }
 }
+
+export class ChannelNotFoundException extends DomainException {
+  constructor() {
+    super('CHANNEL_NOT_FOUND', 404, 'Channel not found for the current user');
+  }
+}
+
+export class VideoNotFoundException extends DomainException {
+  constructor() {
+    super('VIDEO_NOT_FOUND', 404, 'Video not found');
+  }
+}
+
+export class VideoNotInDraftStatusException extends DomainException {
+  constructor() {
+    super('VIDEO_NOT_IN_DRAFT_STATUS', 409, 'Video is not in draft status');
+  }
+}
+
+export class VideoUploadCompletionFailedException extends DomainException {
+  constructor() {
+    super(
+      'VIDEO_UPLOAD_COMPLETION_FAILED',
+      422,
+      'Failed to complete the video upload',
+    );
+  }
+}

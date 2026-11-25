@@ -9,9 +9,9 @@ libs:
     context7_id: "unavailable — see note below"
     fetched_at: "2026-11-25T12:10:00-00:00"
   ioredis:
-    version: "^6.1.0"
+    version: "^5.11.1"
     context7_id: "unavailable — see note below"
-    fetched_at: "2026-11-25T12:10:00-00:00"
+    fetched_at: "2026-11-25T12:13:00-00:00"
   "@aws-sdk/client-s3":
     version: "^3.1177.0"
     context7_id: "unavailable — see note below"
@@ -28,6 +28,8 @@ sources_mtime:
 
 **Note on sourcing (read before anything else in this file):** `CLAUDE.md` mandates the **context7** MCP tool for library documentation lookup before implementing. This session's `.mcp.json` only configures a `postgres` MCP server — no `context7` tool is available in this environment (confirmed by inspecting `.mcp.json` directly; not an oversight, a genuine environment gap). Per the project's own fallback framing ("Consulte sempre a documentação oficial da ferramenta"), official documentation was instead sourced via web search/fetch against `docs.nestjs.com`, `docs.bullmq.io`, and the AWS SDK's own package pages, cross-checked where fetches failed against the exact installed version shown above (`npm view <pkg> version`, run against the real npm registry from inside this environment — not assumed). Every API shape below that could not be verified from a successfully fetched page is marked **(unverified against a live doc page — confirmed instead by `npx tsc --noEmit` passing against the installed `@types` during implementation)**. This is the same honest-discrepancy-flagging the project's own rule requires when context7 is unavailable; `npmjs.com` itself returned a client error to the fetch tool during this research pass, and the AWS multipart-upload developer-guide page had no JavaScript example (only C++/Rust/CLI), so the gap is disclosed rather than hidden.
 
+**Note on local verification methodology:** the coding sandbox this phase was implemented in cannot pull Docker images (`registry-1.docker.io` is blocked by the environment's network policy — confirmed by direct `docker pull` failures, not assumed), so `docker compose up` itself cannot run here. The committed `compose.yaml`/`Dockerfile.dev` are unaffected and are exactly what runs on the user's machine or in CI, where Docker Hub is reachable. To still verify real behavior rather than only `tsc`/mocks, PostgreSQL, Redis, and `ffmpeg`/`ffprobe` were installed directly on the sandbox host via `apt-get` (the package registries themselves are reachable), and `moto[server]` (a Python S3-API mock, via `pip`) stood in for MinIO on `localhost:9000` purely for this local verification — the real `StorageService` code talks to it over the same S3 API it would use against real MinIO, with no test-only code paths. Every claim of "verified end-to-end" below (the worker's success path, its failure/retry path, the real TypeORM migration, and the `ioredis` dependency bug) was exercised this way against real processes, not asserted from reading the code.
+
 ## @nestjs/bullmq + bullmq
 
 **Source:** `docs.nestjs.com/techniques/queues` (fetched, verbatim through the "Separate processes" section) + `docs.bullmq.io/guide/nestjs/` and `docs.bullmq.io/guide/retrying-failing-jobs` (fetched). Maps to `phase-03-videos/TD-01` and `TD-06`.
@@ -35,8 +37,10 @@ sources_mtime:
 ### Install
 
 ```bash
-npm install @nestjs/bullmq bullmq
-```//`ioredis` is a transitive dependency of `bullmq`; pinned directly too since `StorageService`/connection config references `ioredis` types nowhere — confirmed not needed as a direct import in this phase's code, kept as a documented transitive version only.
+npm install @nestjs/bullmq bullmq ioredis@5.11.1
+```
+
+**Correction found during local verification (not a sourcing gap — a real dependency bug caught by actually running the code):** `bullmq` lists `ioredis` as a `peerDependency` (`>=5.0.0`), not a regular/transitive dependency, and nothing in this project's own `package.json` pinned it. `npm install @nestjs/bullmq bullmq` alone left `ioredis` **absent from `node_modules` entirely** — confirmed by `npm ls ioredis` (empty) and by actually constructing a `Queue({ connection: { host, port } })` against a real local Redis, which threw `BullMQ could not load the optional 'ioredis' package` at runtime. This would have failed identically inside the real Docker Compose stack; it is not an artifact of this sandbox. `ioredis@6.x` was tried first and rejected by npm (`ERESOLVE`) because `typeorm@0.3.28` also carries a `peerOptional` dependency on `ioredis@^5.0.4`; `ioredis@5.11.1` satisfies both ranges and installed cleanly. `ioredis` is now a direct `dependency` in `package.json`, not left as an undeclared transitive package.
 
 ### Root registration (`AppModule`, API; `WorkerModule`, worker — same connection config, shared via `queue.config.ts`)
 
@@ -90,11 +94,11 @@ export class VideoProcessor extends WorkerHost {
 }
 ```
 
-Confirmed verbatim from `docs.bullmq.io/guide/nestjs/`: `@Processor('queueName')` on a class `extends WorkerHost` implementing `async process(job: Job<...>): Promise<any>`; **the old Bull `@Process('name')` method decorator is explicitly unsupported** ("This doesn't work with BullMQ") — branch on `job.name` inside `process()` if multiple job names shared a queue (not needed here, this phase uses a single job name per queue). `@OnWorkerEvent('completed')` is the page's own confirmed example shape (parameterless in their sample); `@OnWorkerEvent('failed')` itself, and its exact callback parameters, were **not** shown on either fetched page. **(unverified against a live doc page — confirmed instead by `npx tsc --noEmit` passing against the installed `@nestjs/bullmq` types during implementation, which will reject an incorrect parameter list at compile time since the decorator is strongly typed against BullMQ's `WorkerListener` interface.)**
+Confirmed verbatim from `docs.bullmq.io/guide/nestjs/`: `@Processor('queueName')` on a class `extends WorkerHost` implementing `async process(job: Job<...>): Promise<any>`; **the old Bull `@Process('name')` method decorator is explicitly unsupported** ("This doesn't work with BullMQ") — branch on `job.name` inside `process()` if multiple job names shared a queue (not needed here, this phase uses a single job name per queue). `@OnWorkerEvent('completed')` is the page's own confirmed example shape (parameterless in their sample); `@OnWorkerEvent('failed')` itself, and its exact callback parameters, were **not** shown on either fetched page. **Now fully verified, not just type-checked:** `npx tsc --noEmit` accepted the `(job: Job<VideoProcessingJobData>, error: Error)` signature against the installed `@nestjs/bullmq` types, and — beyond compile-time typing — the handler was exercised against a real local Redis/Postgres/MinIO-compatible (moto) stack: a job seeded with `{ attempts: 2, backoff: { type: 'fixed', delay: 500 } }` against a video pointing at a nonexistent storage key was run through the actual compiled worker (`node dist/worker/main.js`), and the video row was confirmed to flip to `status = 'error'` with `error_message = 'The specified key does not exist.'` only after both attempts were exhausted.
 
 ### Detecting final failure (TD-06)
 
-`docs.bullmq.io/patterns/stop-retrying-jobs` (fetched) confirms two counters exist on `Job`: `attemptsStarted` (increments each time the job moves to active) and `attemptsMade` (increments when a non-rate-limit error is thrown) — but does not state whether either is 0- or 1-based, nor give a canonical "is this the final failure" check for a `failed` listener. This phase's `onFailed` handler compares `job.attemptsMade >= (job.opts.attempts ?? 1)` to decide whether to write `status = 'error'` to the database (vs. leaving the row `processing` for an in-flight retry) — **(unverified against a live doc page; the comparison's correctness is instead proven by this phase's own integration test, which forces a job to exhaust all 3 attempts against a deliberately-corrupt fixture and asserts the video lands in `error` exactly once, not after the first of three attempts).**
+`docs.bullmq.io/patterns/stop-retrying-jobs` (fetched) confirms two counters exist on `Job`: `attemptsStarted` (increments each time the job moves to active) and `attemptsMade` (increments when a non-rate-limit error is thrown) — but does not state whether either is 0- or 1-based, nor give a canonical "is this the final failure" check for a `failed` listener. This phase's `onFailed` handler compares `job.attemptsMade >= (job.opts.attempts ?? 1)` to decide whether to write `status = 'error'` to the database (vs. leaving the row `processing` for an in-flight retry). **Verified empirically** (see above): after the queued job exhausted both configured attempts, `queue.getJobs(['failed'])` showed `attemptsMade: 2` against `opts.attempts: 2` — confirming `attemptsMade` is 1-based and counts completed (not just started) attempts, and that `>=` is the correct comparison for "this was the final attempt."
 
 ---
 

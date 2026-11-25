@@ -149,6 +149,71 @@ NestJS with standard module structure. Source lives in `src/`, compiled output i
 - Each domain feature gets its own module (e.g., `UsersModule`, `VideosModule`) registered in `AppModule`
 - Controllers handle HTTP routing; Services hold business logic; both are scoped to their module
 
+## Videos / Storage / Queue
+
+### Module
+
+`VideosModule` (`src/videos/`) owns the video upload/playback lifecycle. Endpoints:
+
+| Method & Path                         | Auth      | Purpose                                                              |
+|----------------------------------------|-----------|-----------------------------------------------------------------------|
+| `POST /videos/uploads`                 | required  | Create a draft video + S3 multipart upload; returns a presigned URL per part |
+| `POST /videos/:id/uploads/complete`    | required  | Complete the multipart upload, move to `processing`, enqueue a job    |
+| `GET /videos`                          | required  | List the caller's own videos, every status                            |
+| `GET /videos/:id`                      | `@Public` | Public video metadata — only for `status: 'ready'`                    |
+| `GET /videos/:id/stream`               | `@Public` | 302 to a presigned inline-playback URL (supports byte ranges)         |
+| `GET /videos/:id/download`             | `@Public` | 302 to a presigned URL with `Content-Disposition: attachment`         |
+| `GET /videos/:id/thumbnail`            | `@Public` | 302 to a presigned URL for the generated thumbnail                    |
+
+Upload part size, max upload size, and presigned-URL TTLs are all configurable — see env vars below.
+
+### Video Status Lifecycle
+
+```
+draft → processing → ready
+                   ↘ error
+```
+
+- `draft` — row created by `initiateUpload`; the multipart upload is open but not yet completed.
+- `processing` — `completeUpload` succeeded against storage; a job is enqueued; the public read endpoints 404 until `ready`.
+- `ready` — `VideoProcessor` finished: `duration_seconds`, `metadata` (width/height/codec/bitrate/frameRate), and `thumbnail_key` are set.
+- `error` — `VideoProcessor` exhausted all configured BullMQ attempts; `error_message` is set. A video never moves out of `error` automatically.
+
+`VideoProcessor#process` is idempotent: it no-ops if the video isn't `processing` when the job runs, so a retried/replayed job after a crash can't reprocess or corrupt an already-`ready` (or already-failed) video.
+
+### StorageModule and the Internal/Public Endpoint Split (TD-05)
+
+`StorageModule` (`src/storage/`) wraps `@aws-sdk/client-s3` against MinIO (or S3 in production). It holds **two** `S3Client` instances:
+
+- `internalClient` — built from `STORAGE_ENDPOINT` (the Docker service name, e.g. `http://minio:9000`). Used for every direct SDK call made from inside the API/worker containers (`createMultipartUpload`, `completeMultipartUpload`, `putObject`, `downloadToFile`, bucket bootstrap).
+- `publicClient` — built from `STORAGE_PUBLIC_ENDPOINT` (a host/browser-reachable address). Used **only** to presign URLs (`presignUploadPartUrl`, `presignGetUrl`) that are handed back to a caller — a browser or external client can never resolve the Docker-internal `minio` hostname, so presigned URLs must be signed against the externally-reachable endpoint even though the signing call itself happens inside the container.
+
+Never presign a URL with `internalClient`, and never make a direct (non-presigned) SDK call with `publicClient`.
+
+### The `nestjs-worker` Service
+
+Video processing (FFmpeg metadata extraction + thumbnail generation) runs in a separate process from the HTTP API:
+
+- `src/worker/worker.module.ts` + `src/worker/main.ts` — a `NestFactory.createApplicationContext` (no HTTP server) that imports only `VideoProcessingModule`. It has no `AuthModule`/`ThrottlerModule`/guards — there's no inbound request to guard.
+- Compose service: `nestjs-worker`, running `npm run start:worker:dev` (`start:worker:prod` in production), built from the same `Dockerfile.dev`/image as `nestjs-api`.
+- Observe it with `docker compose logs nestjs-worker` (or `docker compose logs -f nestjs-worker` to follow).
+- It consumes `VIDEO_PROCESSING_QUEUE` jobs enqueued by `VideosService#completeUpload`, via `VideoProcessor` (`@Processor(VIDEO_PROCESSING_QUEUE)` / `WorkerHost`).
+
+Any module that registers the `Video` entity must transitively have `Channel` (and `Channel`'s own `User` relation) registered somewhere in the same module graph, or TypeORM throws `Entity metadata for Video#channel was not found` at `DataSource.initialize()` — this is why `VideoProcessingModule` imports `UsersModule` even though `VideoProcessor` never calls `UsersService`/`ChannelsService` directly.
+
+### Env Vars
+
+| Var                              | Purpose                                                             |
+|-----------------------------------|----------------------------------------------------------------------|
+| `STORAGE_ENDPOINT`                 | S3/MinIO endpoint for direct (internal) SDK calls                   |
+| `STORAGE_PUBLIC_ENDPOINT`          | S3/MinIO endpoint used when presigning URLs handed back to clients  |
+| `STORAGE_REGION`, `STORAGE_ACCESS_KEY_ID`, `STORAGE_SECRET_ACCESS_KEY`, `STORAGE_BUCKET` | Standard S3 client config |
+| `VIDEO_UPLOAD_PART_SIZE_BYTES`     | Multipart upload chunk size (default 100MB; S3/MinIO reject any part but the last under 5MiB) |
+| `VIDEO_UPLOAD_MAX_SIZE_BYTES`      | Max total upload size (default 10GB)                                 |
+| `VIDEO_UPLOAD_URL_TTL_SECONDS`     | TTL for presigned upload-part URLs                                   |
+| `VIDEO_PLAYBACK_URL_TTL_SECONDS`   | TTL for presigned stream/download/thumbnail URLs                     |
+| `REDIS_HOST`, `REDIS_PORT`         | BullMQ connection (`VIDEO_PROCESSING_QUEUE`)                         |
+
 ## Code Conventions
 
 - **TypeScript:** `nodenext` module resolution, `ES2023` target, `strictNullChecks` on, `noImplicitAny` off
